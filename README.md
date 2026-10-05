@@ -26,13 +26,30 @@ python3 app.py --db ./data.db --port 8317
 
 - `GET /health`
 - `GET /api/items`
-- `POST /api/items`
+- `POST /api/items`（可选 `occupant_density`）
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/batches`：震后复评批次，同批串起工单修订、离线测量与加固方案
+- `GET /api/batches/{batch_no}`
+- `GET /api/items/{id}/components[?status=effective|pending_review|superseded]`
+- `POST /api/component-versions/{id}/promote`：待复核版本人工提为生效
+- `GET /api/items/{id}/schemes`
+- `GET /api/items/{id}/conclusions`
+- `POST /api/items/{id}/review-decision`：评审委员会对审核结论 `active`/`rejected`
+- `POST /api/items/{id}/backfill`：旧工单缺字段补全后照常读回并重算
 - `GET /api/audit`
 
 允许角色：assessor, structural_engineer, review_board, viewer。风险分值和人员密度共同影响排序；审核通过前必须完成评估、设计和施工证据登记。
+
+## 震后复评批次语义
+
+- **同一批次**：工单版本号、构件测量版本、加固方案版本在一个数据库事务内提交，整批成功或整批回滚，不存在半批覆盖。
+- **并发去重**：同一构件已有生效材料版本时，后到版本不覆盖，自动转 `pending_review`（生效位由部分唯一索引保证只有一个），经工程师或评审委员会 `promote` 后才生效。
+- **失效重算**：生效测量或人员密度改变输入指纹后，旧优先级结论与审核结论置 `invalidated`，优先级重算，审核回到 `pending`；仅加固方案换版时只失效审核结论。
+- **批次幂等**：`batch_no` 加内容哈希。同号同内容重传只入库一次（返回 `duplicate: true`）；同号不同内容返回 409。
+- **失败重试**：写入失败（含工单乐观锁冲突）整批回滚、原工单保留，失败尝试记入 `batch_attempts`，同一批次号修正后可重试。
+- **旧工单兼容**：新字段（`occupant_density`、`current_batch_no`）可空，读回时按默认值兜底，`backfill` 持久化补全并重算。
 
 ## 测试
 

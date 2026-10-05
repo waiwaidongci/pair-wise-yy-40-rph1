@@ -14,6 +14,11 @@ def calculate_hash(previous_hash: str, payload: dict) -> str:
     return hashlib.sha256((previous_hash + ":").encode("utf-8") + raw).hexdigest()
 
 
+def canonical_hash(payload: dict) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def make_entry(action: str, entity_type: str, entity_id: int, actor: str,
                detail: dict, previous_hash: str) -> dict:
     payload = {
