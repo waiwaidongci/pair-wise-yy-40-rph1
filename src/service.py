@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ValidationError, ensure_role, normalize_severity,
+                     require_int, require_number, require_text)
 from .repository import Repository
 from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
                     VIEW_ROLES, completion_blockers, escalation_required,
@@ -91,13 +92,120 @@ class Service:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
+    # ---- 批次入库：工单、测量、加固方案串成同一批次 ----
+
+    def ingest_batch(self, payload: Dict[str, Any], actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, RECORD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        # 先校验全部输入，再触库；校验失败不产生任何写入
+        batch_no = require_text(payload.get("batch_no"), "batch_no", 100)
+        item_id = require_int(payload.get("item_id"), "item_id")
+        density = require_number(payload.get("density", 0), "density")
+        raw_measurements = payload.get("measurements", [])
+        raw_plans = payload.get("reinforcement_plans", [])
+        if not isinstance(raw_measurements, list):
+            raise ValidationError("measurements必须是数组")
+        if not isinstance(raw_plans, list):
+            raise ValidationError("reinforcement_plans必须是数组")
+        measurements = []
+        for m in raw_measurements:
+            if not isinstance(m, dict):
+                raise ValidationError("measurement必须是对象")
+            measurements.append({
+                "component": require_text(m.get("component"), "component", 100),
+                "material_version": require_text(
+                    m.get("material_version"), "material_version", 100),
+                "quantity": require_number(m.get("quantity"), "quantity"),
+            })
+        plans = []
+        for p in raw_plans:
+            if not isinstance(p, dict):
+                raise ValidationError("plan必须是对象")
+            plans.append({
+                "component": require_text(p.get("component"), "component", 100),
+                "material_version": require_text(
+                    p.get("material_version"), "material_version", 100),
+                "plan": require_text(p.get("plan"), "plan"),
+            })
+        # 工单必须存在
+        self.repository.get_item(item_id)
+        # 批次号幂等：同批次号重传只入库一次；committed直接回读
+        batch = self.repository.get_or_create_batch(batch_no, item_id, density, actor)
+        if batch["status"] == "committed":
+            return self._batch_view(batch)
+        # 写入失败：原批次保留（failed），可用同批次号重试
+        try:
+            result = self.repository.write_batch_data(
+                batch["id"], item_id, measurements, plans, density, actor)
+        except Exception:
+            self.repository.mark_batch_status(batch["id"], "failed")
+            raise
+        self.repository.append_audit("ingest", "batch", batch["id"], actor, {
+            "batch_no": batch_no, "item_id": item_id,
+            "measurements": len(result["measurements"]),
+            "plans": len(result["plans"]),
+            "priority": result["conclusion"]["priority"],
+        })
+        return self._batch_view(self.repository.get_batch(batch["id"]))
+
+    def get_batch_view(self, batch_id: int, role: str) -> Dict[str, Any]:
+        self._view(role)
+        return self._batch_view(self.repository.get_batch(batch_id))
+
+    def list_batches_for_item(self, item_id: int, role: str) -> list:
+        self._view(role)
+        self.repository.get_item(item_id)
+        return [self._batch_view(b) for b in self.repository.list_batches(item_id)]
+
+    def get_item_conclusion(self, item_id: int, role: str) -> Optional[Dict[str, Any]]:
+        self._view(role)
+        self.repository.get_item(item_id)
+        return self.repository.get_latest_conclusion(item_id)
+
+    def update_item(self, item_id: int, payload: Dict[str, Any], actor: str,
+                    role: str) -> Dict[str, Any]:
+        ensure_role(role, CREATE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        fields: Dict[str, Any] = {}
+        if "title" in payload:
+            fields["title"] = require_text(payload["title"], "title", 200)
+        if "description" in payload:
+            fields["description"] = require_text(payload["description"], "description")
+        if "severity" in payload:
+            fields["severity"] = normalize_severity(payload["severity"])
+        if "quantity" in payload:
+            fields["quantity"] = require_number(payload["quantity"], "quantity")
+        if "threshold" in payload:
+            fields["threshold"] = require_number(
+                payload["threshold"], "threshold", 0.000001)
+        if "density" in payload:
+            fields["density"] = require_number(payload["density"], "density")
+        if not fields:
+            return self.get_item(item_id, role)
+        updated = self.repository.update_item_fields(item_id, fields)
+        self.repository.append_audit("update", ENTITY, item_id, actor, {
+            "fields": sorted(fields.keys()),
+        })
+        return self.enrich(updated)
+
+    def _batch_view(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "batch": batch,
+            "measurements": self.repository.list_measurements(batch["id"]),
+            "reinforcement_plans": self.repository.list_reinforcement_plans(batch["id"]),
+            "conclusion": self.repository.get_conclusion_for_batch(batch["id"]),
+        }
+
     @staticmethod
     def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(item)
+        density = item.get("density")
+        if density is None:
+            density = 0.0
         result["priority"] = priority_score(
-            item["severity"], item["quantity"], item["threshold"])
+            item["severity"], item["quantity"], item["threshold"], density=density)
         result["deadline_hours"] = response_deadline_hours(
-            item["severity"], item["quantity"], item["threshold"])
+            item["severity"], item["quantity"], item["threshold"], density=density)
         result["escalation_required"] = escalation_required(
-            item["severity"], item["quantity"], item["threshold"])
+            item["severity"], item["quantity"], item["threshold"], density=density)
         return result
